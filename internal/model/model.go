@@ -31,7 +31,8 @@ const (
 	// FindingType discriminates between possible finding shapes. v0.1 only
 	// emits package_exposure (exact name+version match against an
 	// operator-supplied exposure catalog).
-	FindingTypePackageExposure = "package_exposure"
+	FindingTypePackageExposure    = "package_exposure"
+	FindingTypePlaintextCredential = "plaintext_credential"
 )
 
 const (
@@ -43,6 +44,7 @@ const (
 	EcosystemMCP              = "mcp"
 	EcosystemEditorExtension  = "editor-extension"
 	EcosystemBrowserExtension = "browser-extension"
+	EcosystemHomebrew         = "homebrew"
 )
 
 var supportedEcosystems = map[string]struct{}{
@@ -54,6 +56,7 @@ var supportedEcosystems = map[string]struct{}{
 	EcosystemMCP:              {},
 	EcosystemEditorExtension:  {},
 	EcosystemBrowserExtension: {},
+	EcosystemHomebrew:         {},
 }
 
 var supportedEcosystemOrder = []string{
@@ -65,6 +68,7 @@ var supportedEcosystemOrder = []string{
 	EcosystemMCP,
 	EcosystemEditorExtension,
 	EcosystemBrowserExtension,
+	EcosystemHomebrew,
 }
 
 // SupportedEcosystems returns the emitted ecosystem values supported by v0.1.

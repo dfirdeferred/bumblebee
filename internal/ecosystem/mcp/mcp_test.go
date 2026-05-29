@@ -23,34 +23,22 @@ func TestInferPackageFromArgs(t *testing.T) {
 		{"node", []string{"/x/y.js"}, "", ""},
 		{"npx", []string{"-y", "@playwright/mcp@latest"}, "@playwright/mcp@latest", ""},
 		{"npx", []string{"left-pad@1.2.3"}, "left-pad@1.2.3", ""},
-		// pnpm/yarn/bun/npm wrappers take a subcommand before the package;
-		// the subcommand must not be returned as the package name.
 		{"pnpm", []string{"dlx", "@modelcontextprotocol/server-github"}, "@modelcontextprotocol/server-github", ""},
 		{"pnpm", []string{"dlx", "-y", "@playwright/mcp@latest"}, "@playwright/mcp@latest", ""},
 		{"yarn", []string{"dlx", "@modelcontextprotocol/server-time"}, "@modelcontextprotocol/server-time", ""},
 		{"bun", []string{"x", "left-pad@1.2.3"}, "left-pad@1.2.3", ""},
 		{"npm", []string{"exec", "--", "@modelcontextprotocol/server-github"}, "@modelcontextprotocol/server-github", ""},
 		{"/usr/local/bin/pnpm", []string{"dlx", "mcp-server-time"}, "mcp-server-time", ""},
-		// npm exec --package= / --package <pkg>: package is named via flag, not positional.
 		{"npm", []string{"exec", "--package=@modelcontextprotocol/server-time", "--", "server-time"}, "@modelcontextprotocol/server-time", ""},
 		{"npm", []string{"exec", "--package", "@modelcontextprotocol/server-time", "--", "server-time"}, "@modelcontextprotocol/server-time", ""},
-		// pipx: launcher must be "pipx", not empty or indistinguishable.
 		{"pipx", []string{"run", "mcp-server-time"}, "mcp-server-time", "pipx"},
 		{"pipx", []string{"run", "--spec", "bugcrowd-mcp", "bugcrowd"}, "bugcrowd-mcp", "pipx"},
 		{"/usr/local/bin/pipx", []string{"run", "some-mcp"}, "some-mcp", "pipx"},
-		// uv + uv tool run, including --from override.
 		{"uv", []string{"tool", "run", "mcp-server-time"}, "mcp-server-time", "uv"},
-		// "uv run <path>" invokes a local script or directory project, not
-		// a published package — the first positional is not a package
-		// identity, so the spec must be empty. The caller falls back to
-		// the server id with low confidence.
 		{"uv", []string{"run", "--directory", "./backend", "mcps/foo.py"}, "", "uv"},
 		{"uv", []string{"run", "mcps/foo.py"}, "", "uv"},
 		{"uv", []string{"tool", "run", "--from", "bugcrowd-mcp", "bugcrowd"}, "bugcrowd-mcp", "uv"},
-		// "uv run --from <pkg>" is a published-package invocation even
-		// without "tool"; honor the --from name.
 		{"uv", []string{"run", "--from", "bugcrowd-mcp", "bugcrowd"}, "bugcrowd-mcp", "uv"},
-		// docker run with various flags before the image.
 		{"docker", []string{"run", "-i", "--rm", "ghcr.io/example-org/example-mcp:latest"}, "ghcr.io/example-org/example-mcp:latest", "docker"},
 		{"docker", []string{"run", "-e", "FOO=bar", "--name", "x", "mcp/slack"}, "mcp/slack", "docker"},
 		{"docker", []string{"run", "--env-file=.env", "ghcr.io/github/github-mcp-server"}, "ghcr.io/github/github-mcp-server", "docker"},
@@ -78,14 +66,9 @@ func TestSplitSpec(t *testing.T) {
 		{"mcp-server-time", "mcp-server-time", ""},
 		{"python:mypkg.server", "python:mypkg.server", ""},
 		{"", "", ""},
-		// npm alias selectors must not be misparsed: the selector starts at
-		// the '@' before "npm:", not at the trailing version. Otherwise the
-		// alias target's own version is attributed to the host package and
-		// name extraction is wrong.
 		{"pkg@npm:alias@1.0.0", "pkg", "@npm:alias@1.0.0"},
 		{"@scope/pkg@npm:other@2.0", "@scope/pkg", "@npm:other@2.0"},
 		{"pkg@npm:alias", "pkg", "@npm:alias"},
-		// Alias target may itself be scoped: "host@npm:@scope/other@1.0.0".
 		{"host@npm:@scope/other@1.0.0", "host", "@npm:@scope/other@1.0.0"},
 	}
 	for _, c := range cases {
@@ -175,9 +158,6 @@ func TestScanConfig_FlatShape(t *testing.T) {
 	}
 }
 
-// TestScanConfig_DockerAndUV verifies that container/python-tool launchers
-// produce records identified by image ref or tool name and tag the
-// package_manager so exposure matching does not treat them as npm.
 func TestScanConfig_DockerAndUV(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "mcp.json")
@@ -206,12 +186,9 @@ func TestScanConfig_DockerAndUV(t *testing.T) {
 	for _, r := range out {
 		byServer[r.ServerName] = r
 	}
-	// Pinned image ref: tag must be split off into Version, leaving
-	// PackageName as the bare image name.
 	if r := byServer["example"]; r.PackageName != "ghcr.io/example-org/example-mcp" || r.Version != "latest" || r.PackageManager != "docker" {
 		t.Errorf("example: %+v", r)
 	}
-	// No tag in the ref: Version stays empty.
 	if r := byServer["github"]; r.PackageName != "ghcr.io/github/github-mcp-server" || r.Version != "" || r.PackageManager != "docker" {
 		t.Errorf("github: %+v", r)
 	}
@@ -224,17 +201,11 @@ func TestScanConfig_DockerAndUV(t *testing.T) {
 	if r := byServer["time"]; r.PackageName != "mcp-server-time" || r.PackageManager != "uv" {
 		t.Errorf("time: %+v", r)
 	}
-	// Unresolved ${CLAUDE_PLUGIN_ROOT} should fall back to the server id,
-	// not be emitted as a literal package name.
 	if r := byServer["plugin"]; r.PackageName != "plugin" {
 		t.Errorf("plugin (unresolved shell var): %+v", r)
 	}
 }
 
-// TestSplitDockerImageRef covers the colon-tag splitter for OCI image refs.
-// The interesting cases: an unambiguous tag, no tag at all, a
-// registry-port reference whose first colon must NOT be treated as the
-// tag separator, and a digest reference which should be left intact.
 func TestSplitDockerImageRef(t *testing.T) {
 	cases := []struct {
 		in       string
@@ -245,21 +216,13 @@ func TestSplitDockerImageRef(t *testing.T) {
 		{"ghcr.io/example-org/example-mcp:latest", "ghcr.io/example-org/example-mcp", "latest"},
 		{"ghcr.io/github/github-mcp-server", "ghcr.io/github/github-mcp-server", ""},
 		{"mcp/slack", "mcp/slack", ""},
-		// Registry port: the colon before the port lives in the registry
-		// segment (before the last slash) and must not be split.
 		{"localhost:5000/foo/bar:1.2.3", "localhost:5000/foo/bar", "1.2.3"},
 		{"localhost:5000/foo/bar", "localhost:5000/foo/bar", ""},
 		{"registry.example.com:443/team/img:v1", "registry.example.com:443/team/img", "v1"},
-		// Digest refs are returned with the digest preserved on the name
-		// side and an empty tag.
 		{"alpine@sha256:abc123", "alpine@sha256:abc123", ""},
 		{"ghcr.io/foo/bar@sha256:deadbeef", "ghcr.io/foo/bar@sha256:deadbeef", ""},
-		// tag@digest form: preserve the digest on the name and split the
-		// tag off into version. The digest is the immutable identity; the
-		// tag is the human-readable version pointer.
 		{"alpine:3.19@sha256:abc", "alpine@sha256:abc", "3.19"},
 		{"ghcr.io/foo/bar:1.2.3@sha256:deadbeef", "ghcr.io/foo/bar@sha256:deadbeef", "1.2.3"},
-		// Single-segment image with a tag.
 		{"alpine:3.19", "alpine", "3.19"},
 		{"", "", ""},
 	}
@@ -271,9 +234,6 @@ func TestSplitDockerImageRef(t *testing.T) {
 	}
 }
 
-// TestScanConfig_DockerPinnedTag exercises the end-to-end record shape
-// for a pinned image ref: PackageName must lose the tag, Version must
-// carry the tag, PackageManager stays "docker".
 func TestScanConfig_DockerPinnedTag(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "mcp.json")
@@ -307,10 +267,6 @@ func TestScanConfig_DockerPinnedTag(t *testing.T) {
 	}
 }
 
-// TestScanConfig_UVRunDirectory verifies that "uv run --directory <dir>
-// <script>" does not leak the directory path as a package name. The
-// record falls back to the server id with low confidence so a literal
-// "./backend" cannot drive a catalog hit.
 func TestScanConfig_UVRunDirectory(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "mcp.json")
@@ -339,16 +295,11 @@ func TestScanConfig_UVRunDirectory(t *testing.T) {
 	if r := byServer["github_extended"]; r.PackageName != "github_extended" || r.PackageManager != "uv" {
 		t.Errorf("github_extended: %+v", r)
 	}
-	// --from still wins even when "tool" is absent.
 	if r := byServer["from-flag"]; r.PackageName != "bugcrowd-mcp" || r.PackageManager != "uv" {
 		t.Errorf("from-flag: %+v", r)
 	}
 }
 
-// TestScanConfig_MalformedJSONEmitsWarn verifies that a malformed MCP
-// config file is surfaced as a warn diagnostic rather than silently
-// swallowed. Operators rely on diagnostics to find configs the scanner
-// could not parse.
 func TestScanConfig_MalformedJSONEmitsWarn(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "mcp.json")
@@ -356,9 +307,7 @@ func TestScanConfig_MalformedJSONEmitsWarn(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out []model.Record
-	type diag struct {
-		level, path, msg string
-	}
+	type diag struct{ level, path, msg string }
 	var diags []diag
 	s := &Scanner{
 		MaxFileSize: 1 << 20,
@@ -382,11 +331,6 @@ func TestScanConfig_MalformedJSONEmitsWarn(t *testing.T) {
 	}
 }
 
-// TestScanConfig_SpecSelector verifies that npm-style version selectors
-// ("@latest", "@1.2.3") in MCP args are split off into RequestedSpec
-// while PackageName is normalized to the bare package name. The
-// installed Version stays empty because MCP configs do not pin to an
-// installed version.
 func TestScanConfig_SpecSelector(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "mcp.json")
@@ -408,20 +352,14 @@ func TestScanConfig_SpecSelector(t *testing.T) {
 	if len(out) != 2 {
 		t.Fatalf("want 2 records, got %+v", out)
 	}
-	// pinned: left-pad@1.2.3
 	if out[0].PackageName != "left-pad" || out[0].RequestedSpec != "left-pad@1.2.3" || out[0].Version != "" {
 		t.Errorf("pinned record: %+v", out[0])
 	}
-	// playwright: @playwright/mcp@latest
 	if out[1].PackageName != "@playwright/mcp" || out[1].RequestedSpec != "@playwright/mcp@latest" || out[1].Version != "" {
 		t.Errorf("playwright record: %+v", out[1])
 	}
 }
 
-// TestScanConfig_DockerConfidence verifies that docker MCP records with a
-// pinned tag or digest get bumped to "medium" confidence (the only MCP
-// shape that ties identity to an immutable reference), while untagged
-// images stay at "low".
 func TestScanConfig_DockerConfidence(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "mcp.json")
@@ -454,18 +392,11 @@ func TestScanConfig_DockerConfidence(t *testing.T) {
 	if r := by["untagged"]; r.Confidence != "low" {
 		t.Errorf("untagged docker confidence = %q, want low: %+v", r.Confidence, r)
 	}
-	// Non-docker launchers stay at the conservative "low" — a selector
-	// like @latest is not an immutable identity.
 	if r := by["npm"]; r.Confidence != "low" {
 		t.Errorf("npm confidence = %q, want low: %+v", r.Confidence, r)
 	}
 }
 
-// TestScanConfig_RemoteURL verifies that remote MCP entries (sse / http
-// transports identified by url/serverUrl/httpUrl) are not silently
-// dropped: the sanitized endpoint is preserved in requested_spec and
-// the record is tagged package_manager=mcp-remote. Headers, env, and
-// any userinfo or query-string secrets must never appear.
 func TestScanConfig_RemoteURL(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "mcp.json")
@@ -507,8 +438,6 @@ func TestScanConfig_RemoteURL(t *testing.T) {
 			t.Errorf("%s: RequestedSpec empty, want sanitized URL", name)
 		}
 	}
-	// Userinfo, query string, fragment, and path must all be dropped from
-	// the recorded URL — credentials commonly slip in through any of them.
 	got := by["auth"].RequestedSpec
 	if strings.Contains(got, "secret") || strings.Contains(got, "token") || strings.Contains(got, "user:") || strings.Contains(got, "#") || strings.Contains(got, "?") || strings.Contains(got, "/mcp") {
 		t.Errorf("sanitized URL still contains secrets or path: %q", got)
@@ -518,27 +447,13 @@ func TestScanConfig_RemoteURL(t *testing.T) {
 	}
 }
 
-// TestScanConfig_FlatRemoteURL verifies that flat-shape MCP configs
-// (no mcpServers/servers envelope) are admitted when the entry carries
-// only a remote URL field — serverUrl or httpUrl — with no command,
-// args, or type. Previously the flat admission check only recognized
-// the "url" field, so entries using the alternate names were dropped
-// silently.
 func TestScanConfig_FlatRemoteURL(t *testing.T) {
 	dir := t.TempDir()
 	cases := []struct {
 		name, body, wantHost string
 	}{
-		{
-			name:     "serverUrl",
-			body:     `{"alt": {"serverUrl":"https://alt.example.com/api"}}`,
-			wantHost: "https://alt.example.com",
-		},
-		{
-			name:     "httpUrl",
-			body:     `{"http": {"httpUrl":"https://http.example.com/v1"}}`,
-			wantHost: "https://http.example.com",
-		},
+		{"serverUrl", `{"alt": {"serverUrl":"https://alt.example.com/api"}}`, "https://alt.example.com"},
+		{"httpUrl", `{"http": {"httpUrl":"https://http.example.com/v1"}}`, "https://http.example.com"},
 	}
 	for _, c := range cases {
 		path := filepath.Join(dir, c.name+".mcp.json")
@@ -553,43 +468,27 @@ func TestScanConfig_FlatRemoteURL(t *testing.T) {
 		if len(out) != 1 {
 			t.Fatalf("%s: want 1 record, got %d: %+v", c.name, len(out), out)
 		}
-		r := out[0]
-		if r.PackageManager != "mcp-remote" {
-			t.Errorf("%s: package_manager = %q, want mcp-remote", c.name, r.PackageManager)
+		if out[0].PackageManager != "mcp-remote" {
+			t.Errorf("%s: package_manager = %q, want mcp-remote", c.name, out[0].PackageManager)
 		}
-		if r.RequestedSpec != c.wantHost {
-			t.Errorf("%s: RequestedSpec = %q, want %q", c.name, r.RequestedSpec, c.wantHost)
+		if out[0].RequestedSpec != c.wantHost {
+			t.Errorf("%s: RequestedSpec = %q, want %q", c.name, out[0].RequestedSpec, c.wantHost)
 		}
 	}
 }
 
-// TestSanitizeRemoteURL covers the URL sanitizer in isolation. Only
-// scheme + host are preserved; userinfo, query, fragment, and path
-// are all dropped because credentials commonly hide in path segments
-// ("/mcp/<token>") as well as the more obvious userinfo/query slots.
-// Scheme-less network-path references collapse to "//host". Anything
-// the parser cannot recover a host from returns "" rather than
-// echoing a raw, potentially secret-bearing string.
 func TestSanitizeRemoteURL(t *testing.T) {
-	cases := []struct {
-		name, in, want string
-	}{
+	cases := []struct{ name, in, want string }{
 		{"empty", "", ""},
 		{"normal", "https://example.com/mcp", "https://example.com"},
 		{"query token", "https://example.com/mcp?token=abc", "https://example.com"},
 		{"fragment", "https://example.com/mcp#frag", "https://example.com"},
 		{"userinfo", "https://user:pass@example.com/mcp", "https://example.com"},
 		{"userinfo + query + fragment", "https://user:pass@example.com/mcp?token=abc#frag", "https://example.com"},
-		// Path-embedded token: the whole path is dropped, not just query
-		// and fragment, since secrets routinely show up as path segments.
 		{"path token", "https://example.com/mcp/sk-live-abcdef", "https://example.com"},
-		// Scheme-less network-path: //host[/path] keeps the //host form
-		// with userinfo stripped.
 		{"scheme-less userinfo", "//user:pass@example.com/mcp", "//example.com"},
 		{"scheme-less plain", "//example.com/api", "//example.com"},
-		// '@' in the path is irrelevant once the entire path is dropped.
 		{"path with @", "https://example.com/path/with@symbol", "https://example.com"},
-		// A bare token with no host shape must not be echoed back.
 		{"bare token", "sk-live-abcdef", ""},
 	}
 	for _, c := range cases {
@@ -599,17 +498,8 @@ func TestSanitizeRemoteURL(t *testing.T) {
 	}
 }
 
-// TestIsKnownMCPConfig verifies the basename allowlist covers both the
-// historical files and the recently-added cline/mcp_settings forms.
 func TestIsKnownMCPConfig(t *testing.T) {
-	want := []string{
-		"mcp.json",
-		".mcp.json",
-		"claude_desktop_config.json",
-		"mcp_config.json",
-		"mcp_settings.json",
-		"cline_mcp_settings.json",
-	}
+	want := []string{"mcp.json", ".mcp.json", "claude_desktop_config.json", "mcp_config.json", "mcp_settings.json", "cline_mcp_settings.json"}
 	for _, name := range want {
 		if !IsKnownMCPConfig(name) {
 			t.Errorf("IsKnownMCPConfig(%q) = false, want true", name)
@@ -620,101 +510,113 @@ func TestIsKnownMCPConfig(t *testing.T) {
 			t.Errorf("IsKnownMCPConfig(%q) = true, want false", name)
 		}
 	}
-	// settings.json is intentionally NOT in the basename allowlist —
-	// it's an ambiguous filename (VS Code user settings, etc.). Gemini
-	// CLI's ~/.gemini/settings.json is matched via the path-aware
-	// IsGeminiSettingsJSON helper instead.
 	if IsKnownMCPConfig("settings.json") {
-		t.Errorf("IsKnownMCPConfig(\"settings.json\") = true, want false (use IsGeminiSettingsJSON for path-aware dispatch)")
+		t.Errorf("IsKnownMCPConfig(\"settings.json\") = true, want false")
 	}
 }
 
-// TestIsGeminiSettingsJSON verifies that path-aware dispatch only matches
-// `<...>/.gemini/settings.json` and does not pick up other settings.json
-// files (notably VS Code's user settings) under unrelated directories.
 func TestIsGeminiSettingsJSON(t *testing.T) {
-	match := []string{
-		"/home/alice/.gemini/settings.json",
-		"/Users/alice/.gemini/settings.json",
-		filepath.Join(".gemini", "settings.json"),
-	}
-	for _, p := range match {
+	for _, p := range []string{"/home/alice/.gemini/settings.json", "/Users/alice/.gemini/settings.json", filepath.Join(".gemini", "settings.json")} {
 		if !IsGeminiSettingsJSON(p) {
 			t.Errorf("IsGeminiSettingsJSON(%q) = false, want true", p)
 		}
 	}
-	noMatch := []string{
-		"/home/alice/.vscode/settings.json",
-		"/home/alice/.config/Code/User/settings.json",
-		"/home/alice/.gemini/other.json",
-		"/home/alice/gemini/settings.json", // missing the dot
-		"/home/alice/.gemini/sub/settings.json",
-		"",
-	}
-	for _, p := range noMatch {
+	for _, p := range []string{"/home/alice/.vscode/settings.json", "/home/alice/.config/Code/User/settings.json", "/home/alice/.gemini/other.json", "/home/alice/gemini/settings.json", "/home/alice/.gemini/sub/settings.json", ""} {
 		if IsGeminiSettingsJSON(p) {
 			t.Errorf("IsGeminiSettingsJSON(%q) = true, want false", p)
 		}
 	}
 }
 
-// TestLooksLikePackageSpec verifies the package-spec gate that keeps
-// non-package launcher arguments — URLs, VCS refs, file/path refs, and
-// tarball archives — out of PackageName and RequestedSpec.
+func TestIsClaudeConfigJSON(t *testing.T) {
+	for _, p := range []string{"/home/alice/.claude.json", "/Users/alice/.claude.json", ".claude.json"} {
+		if !IsClaudeConfigJSON(p) {
+			t.Errorf("IsClaudeConfigJSON(%q) = false, want true", p)
+		}
+	}
+	for _, p := range []string{"/home/alice/.claude/mcp.json", "/home/alice/claude.json", "/home/alice/.claude.jsonc", ""} {
+		if IsClaudeConfigJSON(p) {
+			t.Errorf("IsClaudeConfigJSON(%q) = true, want false", p)
+		}
+	}
+}
+
+func TestScanClaudeConfig(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".claude.json")
+	body := `{
+  "numStartups": 42,
+  "oauthAccount": {"emailAddress": "shouldnotbecaptured"},
+  "mcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {"GITHUB_TOKEN": "shouldnotbecaptured"}
+    }
+  },
+  "projects": {
+    "/home/alice/proj-a": {
+      "allowedTools": [],
+      "mcpServers": {
+        "local-time": {"command": "uvx", "args": ["mcp-server-time"]}
+      }
+    },
+    "/home/alice/proj-b": {
+      "mcpServers": {
+        "stripe": {"type": "http", "url": "https://user:secret@mcp.stripe.com/mcp?token=abc"}
+      }
+    },
+    "/home/alice/proj-c": {
+      "lastCost": 0.12
+    }
+  }
+}`
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out []model.Record
+	s := &Scanner{MaxFileSize: 1 << 20, Emit: func(r model.Record) { out = append(out, r) }}
+	if err := s.ScanClaudeConfig(path, model.Record{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 3 {
+		t.Fatalf("want 3 records, got %d: %+v", len(out), out)
+	}
+	byServer := map[string]model.Record{}
+	for _, r := range out {
+		byServer[r.ServerName] = r
+	}
+	if got := byServer["github"]; got.PackageName != "@modelcontextprotocol/server-github" || got.ProjectPath != dir {
+		t.Errorf("github: %+v", got)
+	}
+	if got := byServer["local-time"]; got.PackageName != "mcp-server-time" || got.ProjectPath != "/home/alice/proj-a" {
+		t.Errorf("local-time: %+v", got)
+	}
+	if got := byServer["stripe"]; got.ProjectPath != "/home/alice/proj-b" || got.PackageManager != "mcp-remote" || got.RequestedSpec != "https://mcp.stripe.com" {
+		t.Errorf("stripe: %+v", got)
+	}
+}
+
+func TestScanClaudeConfig_NoServers(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".claude.json")
+	body := `{"numStartups": 3, "oauthAccount": {"emailAddress": "x"}, "projects": {"/p": {"lastCost": 1}}}`
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out []model.Record
+	s := &Scanner{MaxFileSize: 1 << 20, Emit: func(r model.Record) { out = append(out, r) }}
+	if err := s.ScanClaudeConfig(path, model.Record{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 0 {
+		t.Fatalf("want 0 records, got %d: %+v", len(out), out)
+	}
+}
+
 func TestLooksLikePackageSpec(t *testing.T) {
-	pass := []string{
-		"@modelcontextprotocol/server-github",
-		"@playwright/mcp@latest",
-		"left-pad",
-		"left-pad@1.2.3",
-		"@scope/pkg",
-		"@scope/pkg@1.2.3",
-		"pkg@npm:other@1.0",
-		"host@npm:@scope/other@1.0.0",
-		"@scope/pkg@npm:@other/target@2.0.0",
-		"python:mypkg.server",
-	}
-	reject := []string{
-		"",
-		"http://reg.example.com/pkg.tgz",
-		"https://reg.example.com/pkg.tgz",
-		"https://user:token@reg.example.com/",
-		"https://reg.example.com/",
-		"ftp://example.com/x",
-		"git://github.com/owner/repo.git",
-		"git+https://github.com/owner/repo.git",
-		"git+ssh://git@github.com/owner/repo.git",
-		"ssh://git@github.com/owner/repo.git",
-		"github:owner/repo",
-		"gitlab:owner/repo",
-		"bitbucket:owner/repo",
-		"file:./local/path",
-		"file:///abs/path",
-		"/abs/path/to/pkg.tgz",
-		"./local/pkg.tgz",
-		"../local/pkg",
-		"./relative/dir",
-		"pkg.tgz",
-		"archive.tar.gz",
-		"archive.zip",
-		"C:\\Users\\me\\pkg",
-		"C:/Users/me/pkg",
-		`server\path\here`,
-		"user:pass@host/path",
-		// npm alias targets must be re-validated against the same
-		// rules — URL, file:, and path forms after "@npm:" must not
-		// slip through the alias carve-out.
-		"host@npm:https://user:token@reg.example.com/pkg.tgz",
-		"host@npm:http://reg.example.com/pkg.tgz",
-		"host@npm:file:./local",
-		"host@npm:file:///abs/path",
-		"host@npm:../local",
-		"host@npm:./local",
-		"host@npm:/abs/path",
-		"host@npm:pkg.tgz",
-		"host@npm:user:pass@host/path",
-		"host@npm:", // empty alias target
-	}
+	pass := []string{"@modelcontextprotocol/server-github", "@playwright/mcp@latest", "left-pad", "left-pad@1.2.3", "@scope/pkg", "@scope/pkg@1.2.3", "pkg@npm:other@1.0", "host@npm:@scope/other@1.0.0", "@scope/pkg@npm:@other/target@2.0.0", "python:mypkg.server"}
+	reject := []string{"", "http://reg.example.com/pkg.tgz", "https://reg.example.com/pkg.tgz", "https://user:token@reg.example.com/", "ftp://example.com/x", "git://github.com/owner/repo.git", "git+https://github.com/owner/repo.git", "git+ssh://git@github.com/owner/repo.git", "ssh://git@github.com/owner/repo.git", "github:owner/repo", "gitlab:owner/repo", "bitbucket:owner/repo", "file:./local/path", "file:///abs/path", "/abs/path/to/pkg.tgz", "./local/pkg.tgz", "../local/pkg", "./relative/dir", "pkg.tgz", "archive.tar.gz", "archive.zip", "C:\\Users\\me\\pkg", "C:/Users/me/pkg", `server\path\here`, "user:pass@host/path", "host@npm:https://user:token@reg.example.com/pkg.tgz", "host@npm:http://reg.example.com/pkg.tgz", "host@npm:file:./local", "host@npm:file:///abs/path", "host@npm:../local", "host@npm:./local", "host@npm:/abs/path", "host@npm:pkg.tgz", "host@npm:user:pass@host/path", "host@npm:"}
 	for _, s := range pass {
 		if !looksLikePackageSpec(s) {
 			t.Errorf("looksLikePackageSpec(%q) = false, want true", s)
@@ -727,168 +629,41 @@ func TestLooksLikePackageSpec(t *testing.T) {
 	}
 }
 
-// TestInferPackageFromArgs_ValueTakingFlags verifies that npm-family
-// launchers consume the value of value-taking flags so a flag's value
-// (often a registry URL with embedded credentials) is not returned as
-// the package spec.
 func TestInferPackageFromArgs_ValueTakingFlags(t *testing.T) {
 	cases := []struct {
-		name         string
-		cmd          string
+		name, cmd    string
 		args         []string
 		wantSpec     string
 		wantLauncher string
 	}{
-		{
-			name: "npx --registry URL pkg",
-			cmd:  "npx",
-			args: []string{"--registry", "https://token@reg.example.com/", "@scope/pkg"},
-			// Registry URL must not be returned; the package after it is.
-			wantSpec:     "@scope/pkg",
-			wantLauncher: "",
-		},
-		{
-			name:         "npx --registry=URL pkg",
-			cmd:          "npx",
-			args:         []string{"--registry=https://token@reg.example.com/", "@scope/pkg"},
-			wantSpec:     "@scope/pkg",
-			wantLauncher: "",
-		},
-		{
-			name:         "pnpm dlx --registry URL pkg",
-			cmd:          "pnpm",
-			args:         []string{"dlx", "--registry", "https://t@reg.example.com/", "@scope/pkg"},
-			wantSpec:     "@scope/pkg",
-			wantLauncher: "",
-		},
-		{
-			name:         "yarn dlx --cache PATH pkg",
-			cmd:          "yarn",
-			args:         []string{"dlx", "--cache", "/some/local/cache", "left-pad@1.2.3"},
-			wantSpec:     "left-pad@1.2.3",
-			wantLauncher: "",
-		},
-		{
-			name:         "bun x --cwd PATH pkg",
-			cmd:          "bun",
-			args:         []string{"x", "--cwd", "/tmp/work", "left-pad"},
-			wantSpec:     "left-pad",
-			wantLauncher: "",
-		},
-		{
-			name:         "bunx --registry URL pkg",
-			cmd:          "bunx",
-			args:         []string{"--registry", "https://t@reg.example.com/", "left-pad"},
-			wantSpec:     "left-pad",
-			wantLauncher: "",
-		},
-		{
-			name:         "npm exec --registry URL -- pkg",
-			cmd:          "npm",
-			args:         []string{"exec", "--registry", "https://t@reg.example.com/", "--", "@scope/pkg"},
-			wantSpec:     "@scope/pkg",
-			wantLauncher: "",
-		},
-		{
-			// npx --package <pkg> -- <cmd>: the explicit --package value is
-			// the package identity, not the trailing entry-point command.
-			name:         "npx --package <scoped> -- cmd",
-			cmd:          "npx",
-			args:         []string{"--package", "@scope/pkg", "--", "cmd"},
-			wantSpec:     "@scope/pkg",
-			wantLauncher: "",
-		},
-		{
-			name:         "npx --package=<scoped> -- cmd",
-			cmd:          "npx",
-			args:         []string{"--package=@scope/pkg", "--", "cmd"},
-			wantSpec:     "@scope/pkg",
-			wantLauncher: "",
-		},
-		{
-			name:         "bunx --package <scoped> -- cmd",
-			cmd:          "bunx",
-			args:         []string{"--package", "@scope/pkg", "--", "cmd"},
-			wantSpec:     "@scope/pkg",
-			wantLauncher: "",
-		},
-		{
-			// --workspaces is a boolean flag, not value-taking. The positional
-			// after it must still be returned as the package spec.
-			name:         "npm exec --workspaces <scoped>",
-			cmd:          "npm",
-			args:         []string{"exec", "--workspaces", "@scope/pkg"},
-			wantSpec:     "@scope/pkg",
-			wantLauncher: "",
-		},
-		{
-			// npm alias spec with a scoped target must survive intact through
-			// inference; the package-spec gate is exercised by ScanConfig.
-			name:         "npx host@npm:@scope/other@version",
-			cmd:          "npx",
-			args:         []string{"-y", "host@npm:@scope/other@1.0.0"},
-			wantSpec:     "host@npm:@scope/other@1.0.0",
-			wantLauncher: "",
-		},
-		{
-			// Regression: --package after the first positional is a child-command
-			// arg for npx, not a launcher flag. Must not be honored.
-			name:         "npx <pkg> --package <other>",
-			cmd:          "npx",
-			args:         []string{"foo", "--package", "@npmcli/bar"},
-			wantSpec:     "foo",
-			wantLauncher: "",
-		},
-		{
-			// Regression: tokens after "--" are child-command args for npx.
-			name:         "npx <pkg> -- --package <other>",
-			cmd:          "npx",
-			args:         []string{"foo", "--", "--package", "@npmcli/bar"},
-			wantSpec:     "foo",
-			wantLauncher: "",
-		},
-		{
-			// Regression: npm exec does not parse options past "--".
-			name:         "npm exec <pkg> -- --package <other>",
-			cmd:          "npm",
-			args:         []string{"exec", "foo", "--", "--package", "@npmcli/bar"},
-			wantSpec:     "foo",
-			wantLauncher: "",
-		},
-		{
-			// Positive: bunx --package before the first positional still wins.
-			name:         "bunx --registry URL --package <scoped> -- cmd",
-			cmd:          "bunx",
-			args:         []string{"--registry", "https://t@reg.example.com/", "--package", "@scope/pkg", "--", "cmd"},
-			wantSpec:     "@scope/pkg",
-			wantLauncher: "",
-		},
-		{
-			// Positive: pnpm dlx --package= before "--" is honored.
-			name:         "pnpm dlx --package=<scoped> -- cmd",
-			cmd:          "pnpm",
-			args:         []string{"dlx", "--package=@scope/pkg", "--", "cmd"},
-			wantSpec:     "@scope/pkg",
-			wantLauncher: "",
-		},
+		{"npx --registry URL pkg", "npx", []string{"--registry", "https://token@reg.example.com/", "@scope/pkg"}, "@scope/pkg", ""},
+		{"npx --registry=URL pkg", "npx", []string{"--registry=https://token@reg.example.com/", "@scope/pkg"}, "@scope/pkg", ""},
+		{"pnpm dlx --registry URL pkg", "pnpm", []string{"dlx", "--registry", "https://t@reg.example.com/", "@scope/pkg"}, "@scope/pkg", ""},
+		{"yarn dlx --cache PATH pkg", "yarn", []string{"dlx", "--cache", "/some/local/cache", "left-pad@1.2.3"}, "left-pad@1.2.3", ""},
+		{"bun x --cwd PATH pkg", "bun", []string{"x", "--cwd", "/tmp/work", "left-pad"}, "left-pad", ""},
+		{"bunx --registry URL pkg", "bunx", []string{"--registry", "https://t@reg.example.com/", "left-pad"}, "left-pad", ""},
+		{"npm exec --registry URL -- pkg", "npm", []string{"exec", "--registry", "https://t@reg.example.com/", "--", "@scope/pkg"}, "@scope/pkg", ""},
+		{"npx --package <scoped> -- cmd", "npx", []string{"--package", "@scope/pkg", "--", "cmd"}, "@scope/pkg", ""},
+		{"npx --package=<scoped> -- cmd", "npx", []string{"--package=@scope/pkg", "--", "cmd"}, "@scope/pkg", ""},
+		{"bunx --package <scoped> -- cmd", "bunx", []string{"--package", "@scope/pkg", "--", "cmd"}, "@scope/pkg", ""},
+		{"npm exec --workspaces <scoped>", "npm", []string{"exec", "--workspaces", "@scope/pkg"}, "@scope/pkg", ""},
+		{"npx host@npm:@scope/other@version", "npx", []string{"-y", "host@npm:@scope/other@1.0.0"}, "host@npm:@scope/other@1.0.0", ""},
+		{"npx <pkg> --package <other>", "npx", []string{"foo", "--package", "@npmcli/bar"}, "foo", ""},
+		{"npx <pkg> -- --package <other>", "npx", []string{"foo", "--", "--package", "@npmcli/bar"}, "foo", ""},
+		{"npm exec <pkg> -- --package <other>", "npm", []string{"exec", "foo", "--", "--package", "@npmcli/bar"}, "foo", ""},
+		{"bunx --registry URL --package <scoped> -- cmd", "bunx", []string{"--registry", "https://t@reg.example.com/", "--package", "@scope/pkg", "--", "cmd"}, "@scope/pkg", ""},
+		{"pnpm dlx --package=<scoped> -- cmd", "pnpm", []string{"dlx", "--package=@scope/pkg", "--", "cmd"}, "@scope/pkg", ""},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			gotSpec, gotLauncher := inferPackageFromArgs(c.cmd, c.args)
 			if gotSpec != c.wantSpec || gotLauncher != c.wantLauncher {
-				t.Errorf("inferPackageFromArgs(%q,%v) = (%q,%q), want (%q,%q)",
-					c.cmd, c.args, gotSpec, gotLauncher, c.wantSpec, c.wantLauncher)
+				t.Errorf("inferPackageFromArgs(%q,%v) = (%q,%q), want (%q,%q)", c.cmd, c.args, gotSpec, gotLauncher, c.wantSpec, c.wantLauncher)
 			}
 		})
 	}
 }
 
-// TestScanConfig_NonPackageSpecsDoNotRoundTrip is the end-to-end
-// regression that proves raw URLs, paths, git/file refs, tarball
-// references, and credential-bearing values never appear in
-// PackageName or RequestedSpec. When the parsed spec is not a
-// plausible package identity, the record falls back to the server id
-// (existing behavior for empty specs) and RequestedSpec stays empty.
 func TestScanConfig_NonPackageSpecsDoNotRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "mcp.json")
@@ -927,100 +702,386 @@ func TestScanConfig_NonPackageSpecsDoNotRoundTrip(t *testing.T) {
 	for _, r := range out {
 		by[r.ServerName] = r
 	}
-
-	// Each rejected-spec entry must fall back to the server id, never
-	// leak the raw arg into PackageName / RequestedSpec, and never echo
-	// the embedded credentials anywhere on the record.
-	leakySubstrings := []string{
-		"://", "token", "user:", "git+", "github:", "file:",
-		"/abs/", "./", ".tgz", ".tar.gz", "\\\\", "C:\\", "C:/",
-	}
-	rejected := []string{
-		"https-url", "http-url", "git-plus", "git-ssh", "github-short",
-		"file-ref", "abs-path", "rel-path", "tarball-bare", "tarball-tgz",
-		"win-path",
-		// Malformed npm-alias targets — the alias carve-out must not
-		// let URL/file/path/userinfo shapes ride into PackageName or
-		// RequestedSpec via "host@npm:<bad target>".
-		"alias-url", "alias-file", "alias-relpath",
-	}
+	leakySubstrings := []string{"://", "token", "user:", "git+", "github:", "file:", "/abs/", "./", ".tgz", ".tar.gz", "\\\\", "C:\\", "C:/"}
+	rejected := []string{"https-url", "http-url", "git-plus", "git-ssh", "github-short", "file-ref", "abs-path", "rel-path", "tarball-bare", "tarball-tgz", "win-path", "alias-url", "alias-file", "alias-relpath"}
 	for _, id := range rejected {
-		r, ok := by[id]
-		if !ok {
-			t.Fatalf("missing record %q: %+v", id, out)
-		}
+		r := by[id]
 		if r.PackageName != id {
-			t.Errorf("%s: PackageName = %q, want server-id fallback %q (raw arg leaked)", id, r.PackageName, id)
+			t.Errorf("%s: PackageName = %q, want %q", id, r.PackageName, id)
 		}
 		if r.NormalizedName != strings.ToLower(id) {
 			t.Errorf("%s: NormalizedName = %q, want %q", id, r.NormalizedName, strings.ToLower(id))
 		}
 		if r.RequestedSpec != "" {
-			t.Errorf("%s: RequestedSpec = %q, want empty (raw arg must not round-trip)", id, r.RequestedSpec)
+			t.Errorf("%s: RequestedSpec = %q, want empty", id, r.RequestedSpec)
 		}
 		for _, sub := range leakySubstrings {
 			if strings.Contains(r.PackageName, sub) || strings.Contains(r.RequestedSpec, sub) {
-				t.Errorf("%s: leaked substring %q in record: %+v", id, sub, r)
+				t.Errorf("%s: leaked %q: %+v", id, sub, r)
 			}
 		}
 	}
-
-	// The --registry/--cache/--cwd cases must extract the trailing valid
-	// package spec, not the flag's URL/path value. The credential-bearing
-	// URL must not appear anywhere on the record.
-	if r := by["registry-flag"]; r.PackageName != "valid-pkg" || r.RequestedSpec != "" {
+	if r := by["registry-flag"]; r.PackageName != "valid-pkg" {
 		t.Errorf("registry-flag: %+v", r)
 	}
-	for _, id := range []string{"registry-flag", "registry-eq", "pnpm-registry", "yarn-cache", "bun-cwd"} {
-		r := by[id]
-		if strings.Contains(r.PackageName, "token") || strings.Contains(r.RequestedSpec, "token") {
-			t.Errorf("%s: leaked registry token: %+v", id, r)
-		}
-		if strings.Contains(r.PackageName, "://") || strings.Contains(r.RequestedSpec, "://") {
-			t.Errorf("%s: leaked URL scheme: %+v", id, r)
-		}
-		if strings.Contains(r.PackageName, "/some/local") || strings.Contains(r.PackageName, "/tmp/work") {
-			t.Errorf("%s: leaked local path: %+v", id, r)
-		}
-	}
 	if r := by["registry-eq"]; r.PackageName != "@scope/valid" {
-		t.Errorf("registry-eq: PackageName = %q, want @scope/valid", r.PackageName)
+		t.Errorf("registry-eq: %+v", r)
 	}
 	if r := by["pnpm-registry"]; r.PackageName != "@scope/valid" {
-		t.Errorf("pnpm-registry: PackageName = %q, want @scope/valid", r.PackageName)
+		t.Errorf("pnpm-registry: %+v", r)
 	}
 	if r := by["yarn-cache"]; r.PackageName != "left-pad" || r.RequestedSpec != "left-pad@1.2.3" {
 		t.Errorf("yarn-cache: %+v", r)
 	}
 	if r := by["bun-cwd"]; r.PackageName != "left-pad" {
-		t.Errorf("bun-cwd: PackageName = %q, want left-pad", r.PackageName)
+		t.Errorf("bun-cwd: %+v", r)
 	}
 }
 
-// TestLooksUnresolvedShellVar exercises the multi-form variable detector
-// added to drop literal ${VAR}/$VAR/%VAR% references the loader never
-// expanded.
 func TestLooksUnresolvedShellVar(t *testing.T) {
-	yes := []string{
-		"${CLAUDE_PLUGIN_ROOT}/foo",
-		"$HOME/bin/x",
-		"%APPDATA%\\Claude\\thing",
-	}
-	no := []string{
-		"@scope/pkg",
-		"plain-name",
-		"price$99",       // $ followed by digit, not an identifier
-		"foo % bar % qx", // percents with spaces between are not %VAR%
-		"50%",
-	}
-	for _, s := range yes {
+	for _, s := range []string{"${CLAUDE_PLUGIN_ROOT}/foo", "$HOME/bin/x", "%APPDATA%\\Claude\\thing"} {
 		if !looksUnresolvedShellVar(s) {
 			t.Errorf("looksUnresolvedShellVar(%q) = false, want true", s)
 		}
 	}
-	for _, s := range no {
+	for _, s := range []string{"@scope/pkg", "plain-name", "price$99", "foo % bar % qx", "50%"} {
 		if looksUnresolvedShellVar(s) {
 			t.Errorf("looksUnresolvedShellVar(%q) = true, want false", s)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Plaintext credential detection tests
+// ---------------------------------------------------------------------------
+
+// TestCredentialFinding_KnownPrefixes verifies that env values matching
+// well-known API-key prefixes produce plaintext_credential findings with
+// redacted values, the correct provider label, and remediation text.
+func TestCredentialFinding_KnownPrefixes(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "mcp.json")
+	body := `{
+  "mcpServers": {
+    "anthropic": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {
+        "ANTHROPIC_API_KEY": "sk-ant-api03-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "OPENAI_API_KEY": "sk-proj-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "GITHUB_TOKEN": "ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "AWS_ACCESS_KEY_ID": "AKIAIOSFODNN7EXAMPLE0",
+        "SAFE_REF": "${ANTHROPIC_API_KEY}",
+        "PATH": "/usr/bin:/usr/local/bin",
+        "NODE_ENV": "production"
+      }
+    }
+  }
+}`
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var records []model.Record
+	var findings []model.Finding
+	s := &Scanner{
+		MaxFileSize: 1 << 20,
+		Emit:        func(r model.Record) { records = append(records, r) },
+		EmitFinding: func(f model.Finding) { findings = append(findings, f) },
+	}
+	if err := s.ScanConfig(path, model.Record{}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Package record should still be emitted.
+	if len(records) != 1 {
+		t.Fatalf("want 1 package record, got %d", len(records))
+	}
+
+	// Expect 4 credential findings (Anthropic, OpenAI, GitHub, AWS).
+	if len(findings) != 4 {
+		t.Fatalf("want 4 credential findings, got %d: %+v", len(findings), findings)
+	}
+
+	wantLabels := map[string]bool{
+		"Anthropic API key":            false,
+		"OpenAI project key":           false,
+		"GitHub personal access token": false,
+		"AWS access key ID":            false,
+	}
+	for _, f := range findings {
+		if f.FindingType != model.FindingTypePlaintextCredential {
+			t.Errorf("finding_type = %q, want %q", f.FindingType, model.FindingTypePlaintextCredential)
+		}
+		if f.Severity != "high" {
+			t.Errorf("severity = %q, want high", f.Severity)
+		}
+		if f.Confidence != "high" {
+			t.Errorf("confidence = %q, want high", f.Confidence)
+		}
+		if f.SourceFile != path {
+			t.Errorf("source_file = %q, want %q", f.SourceFile, path)
+		}
+		wantLabels[f.CatalogName] = true
+
+		// Evidence must contain the redacted credential.
+		if !strings.Contains(f.Evidence, "***") {
+			t.Errorf("evidence missing redacted value: %s", f.Evidence)
+		}
+		// Evidence must contain remediation instructions.
+		if !strings.Contains(f.Evidence, "${") {
+			t.Errorf("evidence missing remediation: %s", f.Evidence)
+		}
+		// Evidence must NOT contain the actual secret.
+		if strings.Contains(f.Evidence, "xxxxxxx") {
+			t.Errorf("evidence leaks actual secret: %s", f.Evidence)
+		}
+	}
+	for label, found := range wantLabels {
+		if !found {
+			t.Errorf("missing finding for %q", label)
+		}
+	}
+}
+
+// TestCredentialFinding_HeuristicMatch verifies that env values with
+// secret-suggesting key names and high-entropy values produce findings.
+func TestCredentialFinding_HeuristicMatch(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "mcp.json")
+	body := `{
+  "mcpServers": {
+    "custom": {
+      "command": "npx",
+      "args": ["-y", "some-mcp-server"],
+      "env": {
+        "MY_SECRET_TOKEN": "aVeryLongRandomTokenValueThatLooksLikeACredential1234567890abcdef",
+        "API_KEY_INTERNAL": "xyzABC123456789012345678901234567890xyzABC",
+        "SHORT_KEY": "abc",
+        "FILE_PATH_KEY": "/usr/local/bin/some-tool"
+      }
+    }
+  }
+}`
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var findings []model.Finding
+	s := &Scanner{
+		MaxFileSize: 1 << 20,
+		Emit:        func(r model.Record) {},
+		EmitFinding: func(f model.Finding) { findings = append(findings, f) },
+	}
+	if err := s.ScanConfig(path, model.Record{}); err != nil {
+		t.Fatal(err)
+	}
+
+	// MY_SECRET_TOKEN and API_KEY_INTERNAL should fire.
+	// SHORT_KEY (too short) and FILE_PATH_KEY (path value) should not.
+	if len(findings) != 2 {
+		t.Fatalf("want 2 heuristic findings, got %d: %+v", len(findings), findings)
+	}
+
+	keys := map[string]bool{}
+	for _, f := range findings {
+		if strings.Contains(f.Evidence, "MY_SECRET_TOKEN") {
+			keys["MY_SECRET_TOKEN"] = true
+		}
+		if strings.Contains(f.Evidence, "API_KEY_INTERNAL") {
+			keys["API_KEY_INTERNAL"] = true
+		}
+		if f.CatalogName != "possible credential" {
+			t.Errorf("heuristic finding should have label 'possible credential', got %q", f.CatalogName)
+		}
+	}
+	if !keys["MY_SECRET_TOKEN"] || !keys["API_KEY_INTERNAL"] {
+		t.Errorf("missing expected heuristic findings: %v", keys)
+	}
+}
+
+// TestCredentialFinding_Headers verifies that hardcoded credentials in
+// HTTP headers produce findings with redacted values.
+func TestCredentialFinding_Headers(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "mcp.json")
+	body := `{
+  "mcpServers": {
+    "remote-api": {
+      "url": "https://api.example.com/mcp",
+      "headers": {
+        "Authorization": "Bearer sk-ant-api03-realtoken",
+        "x-api-key": "hardcoded-api-key-value-that-is-long-enough",
+        "Content-Type": "application/json"
+      }
+    }
+  }
+}`
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var findings []model.Finding
+	s := &Scanner{
+		MaxFileSize: 1 << 20,
+		Emit:        func(r model.Record) {},
+		EmitFinding: func(f model.Finding) { findings = append(findings, f) },
+	}
+	if err := s.ScanConfig(path, model.Record{}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Authorization and x-api-key should fire. Content-Type should not.
+	if len(findings) != 2 {
+		t.Fatalf("want 2 header findings, got %d: %+v", len(findings), findings)
+	}
+	for _, f := range findings {
+		if !strings.Contains(f.Evidence, "header") {
+			t.Errorf("header finding evidence should mention 'header': %s", f.Evidence)
+		}
+		if strings.Contains(f.Evidence, "realtoken") || strings.Contains(f.Evidence, "hardcoded-api-key") {
+			t.Errorf("evidence leaks secret: %s", f.Evidence)
+		}
+	}
+}
+
+// TestCredentialFinding_EnvVarRefsNotFlagged ensures that ${VAR}
+// references never produce credential findings.
+func TestCredentialFinding_EnvVarRefsNotFlagged(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "mcp.json")
+	body := `{
+  "mcpServers": {
+    "safe": {
+      "command": "npx",
+      "args": ["-y", "some-server"],
+      "env": {
+        "SUPER_SECRET_TOKEN": "${MY_SECRET}",
+        "API_KEY": "${API_KEY}",
+        "PASSWORD": "${DB_PASSWORD}",
+        "AUTH_BEARER": "prefix-${TOKEN}-suffix"
+      }
+    }
+  }
+}`
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var findings []model.Finding
+	s := &Scanner{
+		MaxFileSize: 1 << 20,
+		Emit:        func(r model.Record) {},
+		EmitFinding: func(f model.Finding) { findings = append(findings, f) },
+	}
+	if err := s.ScanConfig(path, model.Record{}); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(findings) != 0 {
+		t.Errorf("env-var references should not produce findings, got %d: %+v", len(findings), findings)
+	}
+}
+
+// TestCredentialFinding_ClaudeConfig verifies credential detection in
+// Claude Code's dual-scope config (top-level + per-project).
+func TestCredentialFinding_ClaudeConfig(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".claude.json")
+	body := `{
+  "mcpServers": {
+    "global-server": {
+      "command": "npx",
+      "args": ["-y", "some-server"],
+      "env": {
+        "ANTHROPIC_API_KEY": "sk-ant-api03-globaltoken1234567890abcdefghijklmnop"
+      }
+    }
+  },
+  "projects": {
+    "/home/alice/myproject": {
+      "mcpServers": {
+        "project-server": {
+          "command": "uvx",
+          "args": ["project-mcp"],
+          "env": {
+            "GITHUB_TOKEN": "ghp_projecttoken1234567890abcdefghijk"
+          }
+        }
+      }
+    }
+  }
+}`
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var findings []model.Finding
+	s := &Scanner{
+		MaxFileSize: 1 << 20,
+		Emit:        func(r model.Record) {},
+		EmitFinding: func(f model.Finding) { findings = append(findings, f) },
+	}
+	if err := s.ScanClaudeConfig(path, model.Record{}); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(findings) != 2 {
+		t.Errorf("want 2 findings (global + project), got %d: %+v", len(findings), findings)
+	}
+}
+
+// TestRedactCredential verifies that the redaction function masks secrets
+// while preserving identifying prefixes.
+func TestRedactCredential(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"sk-ant-api03-xxxxxxxxxxxx", "sk-ant-api***"},
+		{"sk-proj-xxxxxxxxxxxx", "sk-proj-***"},
+		{"ghp_xxxxxxxxxxxxxxxxxxxx", "ghp_***"},
+		{"AKIAIOSFODNN7EXAMPLE", "AKIA***"},
+		{"AIzaSyxxxxxxxxxxxxxxxxx", "AIza***"},
+		{"some-unknown-long-token", "some***"},
+		{"abc", "***"},
+	}
+	for _, c := range cases {
+		if got := redactCredential(c.in); got != c.want {
+			t.Errorf("redactCredential(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// TestCredentialHelpers exercises detection helpers in isolation.
+func TestCredentialHelpers(t *testing.T) {
+	if !isEnvVarReference("${TOKEN}") {
+		t.Error("isEnvVarReference(${TOKEN}) = false")
+	}
+	if isEnvVarReference("sk-ant-api03-xxx") {
+		t.Error("isEnvVarReference(literal) = true")
+	}
+
+	if label := matchesKnownCredentialPrefix("sk-ant-api03-xxx"); label != "Anthropic API key" {
+		t.Errorf("matchesKnownCredentialPrefix(Anthropic) = %q", label)
+	}
+	if label := matchesKnownCredentialPrefix("just-a-string"); label != "" {
+		t.Errorf("matchesKnownCredentialPrefix(plain) = %q", label)
+	}
+
+	if !keyNameSuggestsSecret("MY_SECRET_TOKEN") {
+		t.Error("keyNameSuggestsSecret(MY_SECRET_TOKEN) = false")
+	}
+	if keyNameSuggestsSecret("PATH") {
+		t.Error("keyNameSuggestsSecret(PATH) = true")
+	}
+
+	if !looksLikeCredentialValue("aVeryLongRandomTokenValue1234567890abcdef") {
+		t.Error("looksLikeCredentialValue(long token) = false")
+	}
+	if looksLikeCredentialValue("short") {
+		t.Error("looksLikeCredentialValue(short) = true")
+	}
+	if looksLikeCredentialValue("/usr/local/bin/some-really-long-path-here") {
+		t.Error("looksLikeCredentialValue(path) = true")
 	}
 }

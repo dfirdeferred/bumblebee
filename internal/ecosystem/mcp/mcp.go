@@ -19,8 +19,13 @@
 // preserved in ServerName so the alias survives even when PackageName
 // is derived from the command/args.
 //
-// Env values are never captured; env key names are not retained either,
-// since the slim v0.1 record schema has no free-form notes field.
+// Env values are never captured in package records. However, env and
+// header blocks are inspected for plaintext credentials: values that
+// match known API-key prefixes or that pair a secret-suggesting key
+// name with a high-entropy value are emitted as plaintext_credential
+// findings with the secret redacted and a remediation message. This
+// surfaces hardcoded secrets in the same NDJSON output stream so
+// operators can act on them alongside package-exposure findings.
 //
 // Remote MCP entries (sse/http transports identified by a url,
 // serverUrl, or httpUrl field with no command) are emitted with
@@ -51,6 +56,7 @@ const Ecosystem = model.EcosystemMCP
 type Scanner struct {
 	MaxFileSize int64
 	Emit        func(model.Record)
+	EmitFinding func(model.Finding)
 	Diag        func(level, path, msg string)
 }
 
@@ -80,10 +86,21 @@ func IsGeminiSettingsJSON(path string) bool {
 		filepath.Base(filepath.Dir(path)) == ".gemini"
 }
 
+// IsClaudeConfigJSON reports whether path is Claude Code's user config
+// file (`<home>/.claude.json`). This file carries MCP servers in two
+// places — top-level `mcpServers` (user scope) and
+// `projects.<dir>.mcpServers` (local scope) — neither of which the
+// generic basename allowlist routes here, so dispatch is path-aware and
+// the file is parsed by ScanClaudeConfig rather than ScanConfig.
+func IsClaudeConfigJSON(path string) bool {
+	return filepath.Base(path) == ".claude.json"
+}
+
 type serverEntry struct {
 	Command   string                 `json:"command"`
 	Args      []string               `json:"args"`
 	Env       map[string]interface{} `json:"env"`
+	Headers   map[string]string      `json:"headers"`
 	URL       string                 `json:"url"`
 	ServerURL string                 `json:"serverUrl"`
 	HTTPURL   string                 `json:"httpUrl"`
@@ -194,6 +211,57 @@ func (s *Scanner) ScanConfig(path string, base model.Record) error {
 		return nil
 	}
 
+	s.emitServers(servers, base, path, filepath.Dir(path))
+	return nil
+}
+
+// ScanClaudeConfig parses Claude Code's user config file
+// (`<home>/.claude.json`). Unlike the single-envelope configs handled by
+// ScanConfig, this file holds MCP servers at two scopes: the top-level
+// `mcpServers` map (user scope, available across all projects) and a
+// per-project `projects.<dir>.mcpServers` map (local scope, private to
+// one project). Both are inventoried. Only those two keys are read; the
+// file's many unrelated settings are ignored, and the flat-object
+// fallback is deliberately not applied here so surrounding config never
+// gets misread as a server entry. Per-project servers carry the project
+// directory in ProjectPath; top-level servers use the config file's own
+// directory.
+func (s *Scanner) ScanClaudeConfig(path string, base model.Record) error {
+	data, err := s.readBounded(path)
+	if err != nil {
+		return err
+	}
+	var doc struct {
+		MCPServers map[string]serverEntry `json:"mcpServers"`
+		Projects   map[string]struct {
+			MCPServers map[string]serverEntry `json:"mcpServers"`
+		} `json:"projects"`
+	}
+	if err := json.Unmarshal(data, &doc); err != nil {
+		if s.Diag != nil {
+			s.Diag("warn", path, "parse Claude config: "+err.Error())
+		}
+		return nil
+	}
+	s.emitServers(doc.MCPServers, base, path, filepath.Dir(path))
+	projectDirs := make([]string, 0, len(doc.Projects))
+	for dir := range doc.Projects {
+		projectDirs = append(projectDirs, dir)
+	}
+	sort.Strings(projectDirs)
+	for _, dir := range projectDirs {
+		s.emitServers(doc.Projects[dir].MCPServers, base, path, dir)
+	}
+	return nil
+}
+
+// emitServers turns a map of parsed server entries into one record each,
+// keyed by the configured server id. sourcePath is recorded as the
+// originating file; projectPath is the directory the servers are scoped
+// to (the config file's own directory for top-level entries, or the
+// per-project key for nested entries). Server ids are emitted in sorted
+// order so a record stream over the same config is deterministic.
+func (s *Scanner) emitServers(servers map[string]serverEntry, base model.Record, sourcePath, projectPath string) {
 	ids := make([]string, 0, len(servers))
 	for k := range servers {
 		ids = append(ids, k)
@@ -201,12 +269,17 @@ func (s *Scanner) ScanConfig(path string, base model.Record) error {
 	sort.Strings(ids)
 	for _, id := range ids {
 		srv := servers[id]
+
+		// Detect plaintext credentials in the env and headers blocks
+		// and emit findings with redacted values and remediation.
+		s.emitCredentialFindings(srv, id, base, sourcePath, projectPath)
+
 		r := base
 		r.Ecosystem = Ecosystem
 		r.PackageManager = "mcp"
 		r.SourceType = "mcp-config"
-		r.SourceFile = path
-		r.ProjectPath = filepath.Dir(path)
+		r.SourceFile = sourcePath
+		r.ProjectPath = projectPath
 		r.RootKind = model.RootKindMCPConfig
 		r.ServerName = id
 		r.Confidence = "low"
@@ -289,7 +362,6 @@ func (s *Scanner) ScanConfig(path string, base model.Record) error {
 		}
 		s.Emit(r)
 	}
-	return nil
 }
 
 // looksUnresolvedShellVar reports whether s contains a literal variable
@@ -352,31 +424,11 @@ func inferPackageFromArgs(cmd string, args []string) (spec, launcher string) {
 	bn := filepath.Base(cmd)
 	switch bn {
 	case "npx", "bunx":
-		// npx/bunx accept "--package <pkg>" / "--package=<pkg>" to name the
-		// package explicitly when it differs from the entry-point command
-		// that follows "--". Honor that first so the flag's value wins over
-		// the positional entry-point name.
-		//
-		// Restrict the scan to the launcher-parsed prefix: stop at "--" and
-		// at the first positional (non-flag) token, since anything after
-		// either is the child command's own args and is not interpreted by
-		// npx/bunx. Otherwise `npx foo --package @npmcli/bar` would be
-		// misread as @npmcli/bar instead of foo.
 		if spec := scanExplicitPackage(args, nil); spec != "" {
 			return spec, ""
 		}
 		return firstNonFlag(args, nil, npmValueTakingFlags), ""
 	case "pnpm", "yarn", "bun", "npm":
-		// These wrappers take a subcommand (dlx, exec, x, run) before the
-		// package. Skip the subcommand so we return the actual package
-		// argument rather than "dlx" / "exec" / "x". Honor
-		// "npm exec --package=<pkg>" / "npm exec --package <pkg>" since
-		// those configs name the package explicitly via flag rather than
-		// positional.
-		//
-		// Restrict the --package scan to args before "--": npm does not
-		// parse options past "--", so `npm exec foo -- --package @npmcli/bar`
-		// must resolve to foo, not @npmcli/bar.
 		subcommands := map[string]bool{
 			"dlx": true, "exec": true, "x": true, "run": true,
 		}
@@ -387,17 +439,6 @@ func inferPackageFromArgs(cmd string, args []string) (spec, launcher string) {
 	case "uvx":
 		return firstNonFlag(args, nil, nil), "uv"
 	case "uv":
-		// Recognize "uv tool run <pkg>" and "uv run <pkg>". Honor "--from <pkg>"
-		// when present: uv allows the entry-point name and the package name
-		// to differ, and only --from carries the package identity.
-		//
-		// Without "--from", "uv run <script-or-dir>" invokes a local script
-		// or a project in a directory rather than a published package, so
-		// the first positional is a path, not a package identity. Detect
-		// "uv run" (no "tool" subcommand, no "--from") and return an empty
-		// spec so the caller falls back to the server id with low
-		// confidence. "uv tool run <pkg>" is a published-tool invocation
-		// and is handled below.
 		hasTool := false
 		for _, a := range args {
 			if a == "tool" {
@@ -417,8 +458,6 @@ func inferPackageFromArgs(cmd string, args []string) (spec, launcher string) {
 			"tool": true, "run": true,
 		}, nil), "uv"
 	case "pipx":
-		// pipx is the PyPI-equivalent of npx and uvx. Honor "pipx run --spec <pkg> <entry>"
-		// so an explicit --spec wins over the entry-point name when they differ.
 		for i := 0; i < len(args); i++ {
 			if args[i] == "--spec" && i+1 < len(args) {
 				return args[i+1], "pipx"
@@ -426,10 +465,6 @@ func inferPackageFromArgs(cmd string, args []string) (spec, launcher string) {
 		}
 		return firstNonFlag(args, map[string]bool{"run": true}, nil), "pipx"
 	case "docker", "podman":
-		// docker run [opts] <image> [cmd...]. Walk args: skip "run" and any
-		// flags (with or without `=`). The first positional after that is
-		// the image reference. Be conservative about flags that take a
-		// separate value argument.
 		valueTakingFlags := map[string]bool{
 			"-e": true, "--env": true, "--env-file": true,
 			"-v": true, "--volume": true, "--mount": true,
@@ -447,12 +482,9 @@ func inferPackageFromArgs(cmd string, args []string) (spec, launcher string) {
 					started = true
 					continue
 				}
-				// Some configs omit the explicit subcommand and start with
-				// flags before the image. Treat that as already started.
 				started = true
 			}
 			if strings.HasPrefix(a, "-") {
-				// Skip "--flag=value" form entirely.
 				if strings.Contains(a, "=") {
 					continue
 				}
@@ -515,9 +547,6 @@ func scanExplicitPackage(args []string, skip map[string]bool) string {
 		if skip[a] {
 			continue
 		}
-		// First positional that is not a recognized subcommand is the
-		// entry-point / package spec; anything after it is child-command
-		// args and must not be scanned for --package.
 		return ""
 	}
 	return ""
@@ -527,7 +556,6 @@ func firstNonFlag(args []string, skip map[string]bool, valueTaking map[string]bo
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		if strings.HasPrefix(a, "-") {
-			// "--flag=value" is one token; nothing else to consume.
 			if strings.Contains(a, "=") {
 				continue
 			}
@@ -544,17 +572,6 @@ func firstNonFlag(args []string, skip map[string]bool, valueTaking map[string]bo
 	return ""
 }
 
-// npmValueTakingFlags lists npm/pnpm/yarn/bun flags that consume a
-// separate value argument. Without skipping past these values, a value
-// like a registry URL (often credential-bearing) can be misread as the
-// package spec. Both short and long forms are included; the
-// "--flag=value" form is handled by firstNonFlag itself.
-//
-// The list is intentionally conservative: it covers the flags that
-// actually appear in MCP launcher commands and the obvious credential-
-// adjacent ones (registry URLs, auth tokens, cache/prefix paths). Flags
-// not listed here are still treated as flags (skipped without consuming
-// the next arg); that matches existing behavior for unknown flags.
 var npmValueTakingFlags = map[string]bool{
 	"--registry":          true,
 	"--reg":               true,
@@ -573,7 +590,7 @@ var npmValueTakingFlags = map[string]bool{
 	"--tag":               true,
 	"--call":              true,
 	"-c":                  true,
-	"--package":           true, // also handled explicitly upstream, kept for safety
+	"--package":           true,
 	"--shell":             true,
 	"--script-shell":      true,
 	"--cwd":               true,
@@ -586,21 +603,6 @@ var npmValueTakingFlags = map[string]bool{
 	"--config-file":       true,
 }
 
-// looksLikePackageSpec reports whether s is a plausible
-// npm/PyPI/uv-style package spec. It rejects forms that npm-family
-// launchers accept but that are not package identities: URLs (http,
-// https, ftp, ssh, git+...), VCS shortcuts (github:, gitlab:, etc.),
-// file:/path: refs, absolute paths, relative paths, and obvious
-// tarball references (.tgz / .tar.gz / .tar.bz2 / .zip suffixes).
-// These are the shapes that can carry credentials or local-fs
-// information and must never round-trip into PackageName or
-// RequestedSpec.
-//
-// Bare names, scoped names, version selectors (pkg@1.2.3,
-// @scope/pkg@latest), and npm alias specs (pkg@npm:other@1.0) are
-// accepted. The "python:<module>" pseudo-spec emitted by the python
-// launcher branch is also accepted so its existing semantics are
-// preserved. Empty input is rejected.
 func looksLikePackageSpec(s string) bool {
 	if s == "" {
 		return false
@@ -608,102 +610,62 @@ func looksLikePackageSpec(s string) bool {
 	if strings.HasPrefix(s, "python:") {
 		return true
 	}
-	// Absolute paths.
 	if strings.HasPrefix(s, "/") {
 		return false
 	}
-	// Windows drive-letter absolute paths (C:\... or C:/...).
 	if len(s) >= 3 && s[1] == ':' && (s[2] == '\\' || s[2] == '/') {
 		c := s[0]
 		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') {
 			return false
 		}
 	}
-	// Relative paths.
 	if strings.HasPrefix(s, "./") || strings.HasPrefix(s, "../") || strings.HasPrefix(s, ".\\") || strings.HasPrefix(s, "..\\") {
 		return false
 	}
-	// Backslash anywhere implies a Windows path rather than a package name.
 	if strings.Contains(s, "\\") {
 		return false
 	}
-	// URL / VCS / file / git-shortcut prefixes. Match case-insensitively
-	// on the scheme prefix only; the rest of the string is left alone.
 	lower := strings.ToLower(s)
 	urlPrefixes := []string{
 		"http://", "https://", "ftp://", "ftps://",
 		"ssh://", "git://", "git+", "svn://", "svn+",
 		"file://", "file:",
 		"github:", "gitlab:", "bitbucket:", "gist:",
-		"npm:", // bare "npm:foo" without a host package is not a valid spec
+		"npm:",
 	}
 	for _, p := range urlPrefixes {
 		if strings.HasPrefix(lower, p) {
 			return false
 		}
 	}
-	// Tarball-looking suffixes — these are local or remote archives, not
-	// package identities. Even if the prefix did not match a URL scheme
-	// (e.g. "pkg.tgz" on its own), npm would resolve it as a file path,
-	// so it carries no package-name signal.
 	tarballSuffixes := []string{".tgz", ".tar.gz", ".tar.bz2", ".tar", ".zip"}
 	for _, suf := range tarballSuffixes {
 		if strings.HasSuffix(lower, suf) {
 			return false
 		}
 	}
-	// Embedded userinfo is the unambiguous credential leak signal: a "@"
-	// before a "/" with no scope-marker leading character. Scoped names
-	// like "@scope/pkg" are fine because the "@" is the first byte.
-	// Version selectors like "pkg@1.2.3" never contain a slash after the
-	// "@". A spec like "user:pass@host/path" would otherwise pass the
-	// other checks.
-	//
-	// npm alias specs are an explicit carve-out: "host@npm:target" and
-	// "host@npm:@scope/target@version" are valid even though the alias
-	// target may contain a "/". Detect the "@npm:" selector after the
-	// first non-leading "@" and validate the alias target with the same
-	// package-spec rules so URL/path/userinfo shapes can't slip through
-	// via "host@npm:https://user:token@reg.example.com/pkg.tgz" etc.
 	if i := strings.Index(s, "@"); i > 0 {
 		if strings.HasPrefix(s[i:], "@npm:") {
 			target := s[i+len("@npm:"):]
-			// Empty target ("host@npm:") is not a valid alias.
 			if target == "" {
 				return false
 			}
-			// Recurse: the target must itself look like a package spec.
-			// This rejects URLs, file:/path: refs, absolute/relative
-			// paths, tarballs, and userinfo shapes.
 			return looksLikePackageSpec(target)
 		}
 		if j := strings.Index(s[i:], "/"); j > 0 {
-			// "@" followed later by "/" — looks like an authority part
-			// of an unschemed URL, not an npm alias selector.
 			return false
 		}
 	}
 	return true
 }
 
-// splitSpec splits an npm-style package spec into (name, selector). For
-// "@playwright/mcp@latest" it returns ("@playwright/mcp", "@latest"); for
-// "left-pad@1.2.3" it returns ("left-pad", "@1.2.3"); for "mcp-server-time"
-// (no selector) it returns ("mcp-server-time", ""). The leading "@" of a
-// scoped package name is preserved on the name; only a trailing
-// "@<selector>" past the scope is treated as the selector.
 func splitSpec(spec string) (name, selector string) {
 	if spec == "" {
 		return "", ""
 	}
-	// python:<module> has no version selector.
 	if strings.HasPrefix(spec, "python:") {
 		return spec, ""
 	}
-	// npm alias form: "pkg@npm:other@version" or "@scope/pkg@npm:other@version".
-	// The selector starts at the '@' immediately before "npm:", not at the
-	// trailing version '@'. Using LastIndex here would mis-attribute the
-	// alias's own version to the host package.
 	start := 0
 	if strings.HasPrefix(spec, "@") {
 		start = 1
@@ -712,7 +674,6 @@ func splitSpec(spec string) (name, selector string) {
 		cut := start + i
 		return spec[:cut], spec[cut:]
 	}
-	// Find the LAST '@' that is not the leading scope marker.
 	idx := strings.LastIndex(spec[start:], "@")
 	if idx <= 0 {
 		return spec, ""
@@ -721,22 +682,10 @@ func splitSpec(spec string) (name, selector string) {
 	return spec[:cut], spec[cut:]
 }
 
-// splitDockerImageRef splits a docker/OCI image reference into (name, tag).
-// Only a colon after the last slash is treated as a tag separator, so a
-// registry-port reference like "localhost:5000/foo/bar:1.2.3" splits to
-// ("localhost:5000/foo/bar", "1.2.3"), and "localhost:5000/foo/bar" with
-// no tag splits to ("localhost:5000/foo/bar", ""). Digest references like
-// "name@sha256:..." are returned with the full name and an empty tag —
-// the digest is preserved as part of the name so it can still match a
-// catalog entry that pins by digest.
 func splitDockerImageRef(ref string) (name, tag string) {
 	if ref == "" {
 		return "", ""
 	}
-	// tag@digest form: "image:tag@sha256:..." — split the tag off into
-	// version and keep the digest on the name so the immutable identity
-	// is preserved. Plain digest refs ("image@sha256:...", no ":tag")
-	// still return with the digest on the name and an empty tag.
 	if at := strings.Index(ref, "@"); at >= 0 {
 		head := ref[:at]
 		digest := ref[at:]
@@ -768,6 +717,306 @@ func splitDockerImageRef(ref string) (name, tag string) {
 		cut = lastSlash + 1 + colon
 	}
 	return ref[:cut], ref[cut+1:]
+}
+
+// ---------------------------------------------------------------------------
+// Plaintext credential detection
+//
+// MCP config files commonly carry API tokens and secrets in their env and
+// headers blocks. Best practice is to use environment variable references
+// (${VAR_NAME}) so the secret is never written to disk in the config file.
+// The functions below detect hardcoded credentials and emit
+// plaintext_credential findings with the secret redacted and a
+// remediation message telling the user exactly how to fix it.
+// ---------------------------------------------------------------------------
+
+// credentialDetection holds the result of inspecting a single env or
+// header value that appears to be a hardcoded credential.
+type credentialDetection struct {
+	source      string // "env" or "header"
+	keyName     string // the env var or header name
+	label       string // human-readable provider label (e.g. "Anthropic API key")
+	redacted    string // the value with the secret portion masked
+	remediation string // actionable fix instructions
+}
+
+// secretKeyPatterns are substrings that, when found case-insensitively in
+// an env key name, suggest the value may be a secret.
+var secretKeyPatterns = []string{
+	"token", "key", "secret", "password", "passwd", "auth",
+	"credential", "cred", "api_key", "apikey", "access_key",
+	"bearer", "jwt",
+}
+
+// knownCredentialPrefixes maps well-known API-key and token value prefixes
+// to human-readable provider labels. Order matters: longer prefixes are
+// listed first so "sk-ant-api" matches before the shorter "sk-" catch-all.
+var knownCredentialPrefixes = []struct {
+	prefix string
+	label  string
+}{
+	{"sk-ant-api", "Anthropic API key"},
+	{"sk-proj-", "OpenAI project key"},
+	{"sk-", "OpenAI/generic API key"},
+	{"ghp_", "GitHub personal access token"},
+	{"gho_", "GitHub OAuth token"},
+	{"ghs_", "GitHub server-to-server token"},
+	{"ghu_", "GitHub user-to-server token"},
+	{"github_pat_", "GitHub fine-grained PAT"},
+	{"glpat-", "GitLab personal access token"},
+	{"AKIA", "AWS access key ID"},
+	{"AIza", "Google API key"},
+	{"xoxb-", "Slack bot token"},
+	{"xoxp-", "Slack user token"},
+	{"xapp-", "Slack app-level token"},
+	{"SG.", "SendGrid API key"},
+	{"hf_", "Hugging Face token"},
+	{"r8_", "Replicate API token"},
+	{"pk_live_", "Stripe live publishable key"},
+	{"sk_live_", "Stripe live secret key"},
+	{"pk_test_", "Stripe test publishable key"},
+	{"sk_test_", "Stripe test secret key"},
+}
+
+// knownNonSecretKeys are env key names (compared case-insensitively) that
+// never hold secrets. Without this allowlist, keys like PATH (contains
+// "key" noise via substring matching) would false-positive.
+var knownNonSecretKeys = map[string]bool{
+	"path": true, "home": true, "user": true, "username": true,
+	"shell": true, "term": true, "lang": true, "lc_all": true,
+	"lc_ctype": true, "tz": true, "display": true, "pwd": true,
+	"oldpwd": true, "hostname": true, "logname": true, "editor": true,
+	"visual": true, "node_path": true, "pythonpath": true, "gopath": true,
+	"goroot": true, "java_home": true, "tmpdir": true, "temp": true,
+	"tmp": true, "http_proxy": true, "https_proxy": true, "no_proxy": true,
+	"all_proxy": true, "debug": true, "verbose": true, "log_level": true,
+	"ci": true, "node_env": true, "rails_env": true, "rack_env": true,
+	"flask_env": true, "django_settings_module": true,
+	"github_actions": true, "gitlab_ci": true,
+	"xdg_config_home": true, "xdg_data_home": true, "xdg_cache_home": true,
+	"xdg_runtime_dir": true, "shlvl": true, "colorterm": true,
+	"term_program": true,
+}
+
+// sensitiveHeaderNames are HTTP header names (compared case-insensitively)
+// whose values typically carry authentication credentials.
+var sensitiveHeaderNames = map[string]bool{
+	"authorization": true,
+	"x-api-key":     true,
+	"api-key":       true,
+	"x-auth-token":  true,
+}
+
+// isEnvVarReference reports whether value contains an environment variable
+// reference like ${VAR_NAME}, indicating the secret is fetched at runtime
+// rather than stored inline.
+func isEnvVarReference(value string) bool {
+	return strings.Contains(value, "${")
+}
+
+// matchesKnownCredentialPrefix returns a human-readable label if value
+// starts with a recognized API-key or token prefix, or "" if no match.
+func matchesKnownCredentialPrefix(value string) string {
+	for _, kp := range knownCredentialPrefixes {
+		if strings.HasPrefix(value, kp.prefix) {
+			return kp.label
+		}
+	}
+	return ""
+}
+
+// keyNameSuggestsSecret reports whether key (case-insensitive) contains a
+// substring that suggests the associated value is a secret, while not
+// being a known non-secret key.
+func keyNameSuggestsSecret(key string) bool {
+	lower := strings.ToLower(key)
+	if knownNonSecretKeys[lower] {
+		return false
+	}
+	for _, pat := range secretKeyPatterns {
+		if strings.Contains(lower, pat) {
+			return true
+		}
+	}
+	return false
+}
+
+// looksLikeCredentialValue applies heuristics to decide whether a string
+// value is likely a hardcoded credential: at least 20 characters, not a
+// file path or URL, and over 80% alphanumeric (token-like entropy).
+func looksLikeCredentialValue(value string) bool {
+	if len(value) < 20 {
+		return false
+	}
+	if strings.HasPrefix(value, "/") ||
+		strings.HasPrefix(value, "http://") ||
+		strings.HasPrefix(value, "https://") {
+		return false
+	}
+	if len(value) >= 3 && value[1] == ':' && (value[2] == '\\' || value[2] == '/') {
+		return false
+	}
+	if strings.HasPrefix(value, "@") && strings.Contains(value, "/") {
+		return false
+	}
+	alnum := 0
+	for _, c := range value {
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') || c == '_' || c == '-' {
+			alnum++
+		}
+	}
+	return float64(alnum)/float64(len(value)) > 0.80
+}
+
+// redactCredential masks the secret portion of a credential value,
+// preserving only the identifying prefix so the provider is recognizable.
+// For known prefixes, the prefix is shown followed by "***". For unknown
+// credentials, the first 4 characters are shown followed by "***".
+func redactCredential(value string) string {
+	for _, kp := range knownCredentialPrefixes {
+		if strings.HasPrefix(value, kp.prefix) {
+			return kp.prefix + "***"
+		}
+	}
+	if len(value) > 4 {
+		return value[:4] + "***"
+	}
+	return "***"
+}
+
+// detectEnvCredentials inspects the env block of an MCP server entry for
+// values that appear to be hardcoded credentials rather than environment
+// variable references. Returns a detection for each flagged value.
+func detectEnvCredentials(env map[string]interface{}) []credentialDetection {
+	if len(env) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(env))
+	for k := range env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var out []credentialDetection
+	for _, key := range keys {
+		val, ok := env[key].(string)
+		if !ok || val == "" {
+			continue
+		}
+		if isEnvVarReference(val) {
+			continue
+		}
+
+		remediation := fmt.Sprintf(
+			"Replace the hardcoded value of %q with an environment variable reference "+
+				"in the MCP config: {\"%s\": \"${%s}\"} — then set the actual value "+
+				"in your shell environment or a secrets manager.",
+			key, key, key,
+		)
+
+		if label := matchesKnownCredentialPrefix(val); label != "" {
+			out = append(out, credentialDetection{
+				source:      "env",
+				keyName:     key,
+				label:       label,
+				redacted:    redactCredential(val),
+				remediation: remediation,
+			})
+			continue
+		}
+		if keyNameSuggestsSecret(key) && looksLikeCredentialValue(val) {
+			out = append(out, credentialDetection{
+				source:      "env",
+				keyName:     key,
+				label:       "possible credential",
+				redacted:    redactCredential(val),
+				remediation: remediation,
+			})
+		}
+	}
+	return out
+}
+
+// detectHeaderCredentials inspects the headers block of an MCP server
+// entry for hardcoded credentials in authentication-related headers.
+func detectHeaderCredentials(headers map[string]string) []credentialDetection {
+	if len(headers) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(headers))
+	for k := range headers {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var out []credentialDetection
+	for _, key := range keys {
+		if !sensitiveHeaderNames[strings.ToLower(key)] {
+			continue
+		}
+		val := headers[key]
+		if val == "" || isEnvVarReference(val) {
+			continue
+		}
+		out = append(out, credentialDetection{
+			source:   "header",
+			keyName:  key,
+			label:    "hardcoded " + key + " header",
+			redacted: redactCredential(val),
+			remediation: fmt.Sprintf(
+				"Replace the hardcoded %q header value with an environment variable "+
+					"reference, or configure the MCP server to read the credential "+
+					"from an environment variable instead.",
+				key,
+			),
+		})
+	}
+	return out
+}
+
+// emitCredentialFindings detects plaintext credentials in the env and
+// headers blocks of an MCP server entry, then emits a
+// plaintext_credential finding for each detection. Each finding carries
+// a redacted preview of the credential and a remediation message.
+func (s *Scanner) emitCredentialFindings(srv serverEntry, serverName string, base model.Record, sourcePath, projectPath string) {
+	if s.EmitFinding == nil {
+		return
+	}
+	var detections []credentialDetection
+	detections = append(detections, detectEnvCredentials(srv.Env)...)
+	detections = append(detections, detectHeaderCredentials(srv.Headers)...)
+
+	for _, d := range detections {
+		evidence := fmt.Sprintf(
+			"%s %q contains a hardcoded %s (%s)",
+			d.source, d.keyName, d.label, d.redacted,
+		)
+
+		f := model.Finding{
+			SchemaVersion:  base.SchemaVersion,
+			ScannerName:    base.ScannerName,
+			ScannerVersion: base.ScannerVersion,
+			RunID:          base.RunID,
+			ScanTime:       base.ScanTime,
+			Endpoint:       base.Endpoint,
+			Profile:        base.Profile,
+			FindingType:    model.FindingTypePlaintextCredential,
+			Severity:       "high",
+			CatalogID:      "plaintext-credential",
+			CatalogName:    d.label,
+			Ecosystem:      Ecosystem,
+			PackageName:    serverName,
+			NormalizedName: strings.ToLower(serverName),
+			RootKind:       model.RootKindMCPConfig,
+			ProjectPath:    projectPath,
+			SourceType:     "mcp-config",
+			SourceFile:     sourcePath,
+			Confidence:     "high",
+			Evidence:       evidence + "; " + d.remediation,
+		}
+		s.EmitFinding(f)
+	}
 }
 
 func (s *Scanner) readBounded(path string) ([]byte, error) {
